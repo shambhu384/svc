@@ -1,8 +1,8 @@
 # svc
 
-An interactive terminal tool for Linux (systemd) that shows what's running, how
-much memory it really uses, and what's listening on ports — and lets you stop
-things safely.
+An interactive terminal tool for **Linux (systemd)** and **macOS (launchd)** that
+shows what's running, how much memory it really uses, and what's listening on
+ports — and lets you stop things safely.
 
 ```
 ┌───┬─────────────────────────┬────────────┬─────────────┬────────────────────────────────────┐
@@ -35,6 +35,27 @@ things safely.
   would restart.
 - **zsh tab completion** for options, running service names and ports.
 
+## macOS
+
+The same script works on macOS (bash 3.2 compatible, no extra
+tools needed — it uses `launchctl`, `lsof` and `ps`). The macOS backend has been
+tested against simulated `launchctl`/`lsof` output, not yet on a real Mac — please
+open an issue if something looks off.
+
+| | Linux | macOS |
+|---|---|---|
+| Services | systemd units | launchd jobs (`launchctl list`) |
+| Default view | system services | **your agents** (`--system` for daemons, uses sudo) |
+| Memory | real memory (cgroup, minus file cache) + with-cache | RSS of the job and its child processes |
+| Ports / connections | `ss` | `lsof` |
+| Stop | `systemctl stop` | `launchctl bootout` |
+| Disable | `systemctl disable` | `launchctl disable` (survives login/reboot) |
+| Dependency warnings | systemd deps + TCP/Unix clients + socket activation | TCP clients |
+
+Apple's own `com.apple.*` jobs are hidden unless you pass `--all`, and are
+flagged as critical; many of them are protected by SIP and can't be stopped.
+Homebrew services show up as `homebrew.mxcl.<name>`.
+
 ## Install
 
 ```bash
@@ -53,8 +74,10 @@ autoload -Uz compinit && compinit
 ## Usage
 
 ```bash
-svc                # system services (stopping uses sudo)
-svc --user         # your user services (no sudo needed)
+svc                # Linux: system services | macOS: your launchd agents
+svc --user         # your user services / launchd agents (no sudo)
+svc --system       # system services / launchd daemons (uses sudo)
+svc --all          # macOS: include Apple's com.apple.* jobs
 svc -f nginx       # only show services matching "nginx"
 svc -p             # listening-ports view
 svc -p -f 8080     # ports view filtered to "8080"
@@ -76,11 +99,14 @@ Inside the menu:
 
 ## Requirements
 
-Linux with systemd (cgroup v2), bash 4+, `ss` (iproute2), `ps`, `awk`, `numfmt`.
+- **Linux:** systemd (cgroup v2), bash, `ss` (iproute2), `ps`, `awk`.
+- **macOS:** nothing extra — works with the built-in bash 3.2, `launchctl`, `lsof`, `ps`, `awk`.
 
 ## Notes
 
 - Connection checks only see connections open *at that moment*; a client that
   connects only occasionally may not be detected.
 - In `--user` mode, processes owned by other users (e.g. root daemons) are shown
-  without a PID because `ss` can't see them without sudo.
+  without a PID (Linux) or not at all (macOS), since they can't be seen without sudo.
+- On macOS, dependency warnings cover TCP connections only (not Unix sockets),
+  and launchd has no equivalent of systemd's `Requires=`.

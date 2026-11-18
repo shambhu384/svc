@@ -1,13 +1,25 @@
 #compdef svc
 
-# Completion for svc (https://github.com/shambhu384/svc)
+# Completion for svc (https://github.com/shambhu384/svc) — Linux and macOS
 
 _svc_filter_values() {
   local -a vals
   if (( ${words[(I)-p|--ports]} )); then
     # Ports view: offer listening ports and process names
-    vals=( ${(f)"$(ss -Htulpn 2>/dev/null | awk '{n=split($5,a,":"); print a[n]; if (match($0, /\(\("[^"]+/)) print substr($0, RSTART+3, RLENGTH-3)}' | sort -u)"} )
+    if [[ $OSTYPE == darwin* ]]; then
+      vals=( ${(f)"$(lsof -nP -iTCP -sTCP:LISTEN -F cn 2>/dev/null | awk '/^c/{print substr($0,2)} /^n/{k=split(substr($0,2),q,":"); print q[k]}' | sort -u)"} )
+    else
+      vals=( ${(f)"$(ss -Htulpn 2>/dev/null | awk '{n=split($5,a,":"); print a[n]; if (match($0, /\(\("[^"]+/)) print substr($0, RSTART+3, RLENGTH-3)}' | sort -u)"} )
+    fi
     _describe -t filters 'port or process' vals
+  elif [[ $OSTYPE == darwin* ]]; then
+    # Running launchd jobs (your agents; Apple's own hidden unless --all)
+    if (( ${words[(I)-a|--all]} )); then
+      vals=( ${(f)"$(launchctl list 2>/dev/null | awk -F'\t' 'NR>1 && $1 ~ /^[0-9]+$/ {print $3}')"} )
+    else
+      vals=( ${(f)"$(launchctl list 2>/dev/null | awk -F'\t' 'NR>1 && $1 ~ /^[0-9]+$/ && $3 !~ /^(com\.apple\.|application\.com\.apple\.)/ {print $3}')"} )
+    fi
+    _describe -t jobs 'running launchd job' vals
   else
     local -a sctl=(systemctl)
     (( ${words[(I)-u|--user]} )) && sctl=(systemctl --user)
@@ -17,8 +29,10 @@ _svc_filter_values() {
 }
 
 _arguments -s \
-  '(-u --user)'{-u,--user}'[show your user services (no sudo)]' \
+  '(-u --user -S --system)'{-u,--user}'[your user services / launchd agents (no sudo)]' \
+  '(-u --user -S --system)'{-S,--system}'[system services / launchd daemons (uses sudo)]' \
+  '(-a --all)'{-a,--all}'[macOS: also show Apple com.apple.* jobs]' \
   '(-p --ports)'{-p,--ports}'[start in the listening-ports view]' \
-  '(-s --sort)'{-s,--sort}'[sort order]:order:((mem\:"by memory usage (default)" name\:"by service name / port"))' \
+  '(-s --sort)'{-s,--sort}'[sort order]:order:((mem\:"by memory usage (default)" name\:"by name / port"))' \
   '(-f --filter)'{-f,--filter}'[only show matching entries]:filter:_svc_filter_values' \
   '(- *)'{-h,--help}'[show help]'
