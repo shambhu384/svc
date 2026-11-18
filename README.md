@@ -110,3 +110,7 @@ Inside the menu:
   without a PID (Linux) or not at all (macOS), since they can't be seen without sudo.
 - On macOS, dependency warnings cover TCP connections only (not Unix sockets),
   and launchd has no equivalent of systemd's `Requires=`.
+
+## License
+
+[MIT](LICENSE) © 2026 shambhu384
