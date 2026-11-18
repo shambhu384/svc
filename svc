@@ -1,0 +1,610 @@
+#!/usr/bin/env bash
+# svc — list running systemd services and optionally stop them.
+#
+# Usage:
+#   svc            # system services (stopping uses sudo)
+#   svc --user     # your user services (no sudo needed)
+#   svc -f nginx   # only show services whose name matches "nginx"
+#   svc -p         # start in the listening-ports view
+#   svc -p -f 8080 # ports view, only port/process matching "8080"
+#   svc -s name    # sort by name/port instead of memory (default: mem)
+
+set -uo pipefail
+
+SCOPE="system"
+FILTER=""
+START_IN_PORTS=0
+SORT_BY="mem"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -u|--user)   SCOPE="user"; shift ;;
+        -f|--filter) FILTER="${2:-}"; shift 2 ;;
+        -p|--ports)  START_IN_PORTS=1; shift ;;
+        -s|--sort)
+            case "${2:-}" in
+                mem|memory) SORT_BY=mem ;;
+                name|port)  SORT_BY=name ;;
+                *) echo "--sort takes 'mem' or 'name'" >&2; exit 1 ;;
+            esac
+            shift 2 ;;
+        -h|--help)
+            sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0 ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+if ! command -v systemctl >/dev/null 2>&1; then
+    echo "Error: systemctl not found (this script needs systemd)." >&2
+    exit 1
+fi
+
+if [[ "$SCOPE" == "user" ]]; then
+    SCTL=(systemctl --user)
+    SUDO=()
+else
+    SCTL=(systemctl)
+    if [[ $EUID -ne 0 ]]; then SUDO=(sudo); else SUDO=(); fi
+fi
+
+# Services that are critical; stopping them can break the session or system.
+CRITICAL_REGEX='^(systemd-.*|dbus(-broker)?|NetworkManager|wpa_supplicant|gdm|sddm|lightdm|display-manager|polkit|ssh|sshd|udisks2|accounts-daemon|user@.*|login|getty@.*)\.service$'
+
+bold=$(tput bold 2>/dev/null || true); reset=$(tput sgr0 2>/dev/null || true)
+red=$(tput setaf 1 2>/dev/null || true); green=$(tput setaf 2 2>/dev/null || true)
+yellow=$(tput setaf 3 2>/dev/null || true)
+
+# Human-readable size from bytes ("-" if unknown)
+human() {
+    [[ "$1" =~ ^[0-9]+$ ]] || { echo "-"; return; }
+    numfmt --to=iec --suffix=B --format='%.1f' "$1" 2>/dev/null || echo "$1"
+}
+
+# Shorten a string to N chars with "..."
+trunc() {
+    local s="$1" n="$2"
+    (( ${#s} > n )) && s="${s:0:n-3}..."
+    printf '%s' "$s"
+}
+
+# Draw tab-separated rows (first row = header) as a box table.
+# $1 = space-separated list of 0-based column indexes to right-align.
+# A row that is exactly "--" draws a separator line.
+box_table() {
+    awk -F'\t' -v right="$1" '
+        BEGIN { n = split(right, r, " "); for (i = 1; i <= n; i++) ra[r[i] + 1] = 1 }
+        { rows[NR] = $0; if ($0 == "--") next
+          for (i = 1; i <= NF; i++) if (length($i) > w[i]) w[i] = length($i)
+          if (NF > nc) nc = NF }
+        function line(l, m, rr,   i, s) {
+            s = l
+            for (i = 1; i <= nc; i++) { s = s rep("─", w[i] + 2); s = s (i < nc ? m : rr) }
+            print s
+        }
+        function rep(c, k,   s) { s = ""; while (k-- > 0) s = s c; return s }
+        END {
+            line("┌", "┬", "┐")
+            for (j = 1; j <= NR; j++) {
+                if (rows[j] == "--") { line("├", "┼", "┤"); continue }
+                nf = split(rows[j], f, "\t"); s = "│"
+                for (i = 1; i <= nc; i++) {
+                    v = (i <= nf ? f[i] : "")
+                    s = s " " (ra[i] ? sprintf("%" w[i] "s", v) : sprintf("%-" w[i] "s", v)) " │"
+                }
+                print s
+                if (j == 1) line("├", "┼", "┤")
+            }
+            line("└", "┴", "┘")
+        }'
+}
+
+# Real (non-reclaimable) memory of a cgroup in bytes: current - file cache + shmem.
+# Falls back to systemd's MemoryCurrent if memory.stat can't be read.
+real_mem() {
+    local cg="$1" cur="$2" stat="/sys/fs/cgroup${1}/memory.stat"
+    if [[ -n "$cg" && -r "$stat" && -r "/sys/fs/cgroup${cg}/memory.current" ]]; then
+        local c; c=$(<"/sys/fs/cgroup${cg}/memory.current")
+        awk -v c="$c" '$1=="file"{f=$2} $1=="shmem"{s=$2} END{r=c-f+s; if(r<0)r=0; print r}' "$stat"
+    elif [[ "$cur" =~ ^[0-9]+$ ]]; then
+        echo "$cur"
+    else
+        echo -1
+    fi
+}
+
+# Real memory of one process in bytes: anonymous + shared memory (no file cache).
+proc_real_mem() {
+    awk '/^RssAnon:|^RssShmem:/{k+=$2} END{if(k=="")print -1; else print k*1024}' \
+        "/proc/$1/status" 2>/dev/null || echo -1
+}
+
+load_services() {
+    SERVICES=(); DESCRIPTIONS=(); MEMS=()
+    local unit load active sub desc
+    local -a units=() descs=()
+    while read -r unit load active sub desc; do
+        [[ -z "$unit" ]] && continue
+        if [[ -n "$FILTER" && "$unit" != *"$FILTER"* ]]; then continue; fi
+        units+=("$unit"); descs+=("$desc")
+    done < <("${SCTL[@]}" list-units --type=service --state=running \
+                 --no-legend --no-pager --plain 2>/dev/null)
+    (( ${#units[@]} == 0 )) && return
+
+    # Real memory of each service's whole cgroup (all its processes):
+    # everything charged to it except file cache the kernel can drop at any time.
+    local -A mem=()
+    local key val id="" cg="" cur=""
+    local -A memall=()
+    flush_mem() {
+        [[ -n "$id" ]] && mem[$id]=$(real_mem "$cg" "$cur")
+        [[ -n "$id" ]] && memall[$id]="$cur"
+        id=""; cg=""; cur=""
+    }
+    while IFS='=' read -r key val; do
+        case "$key" in
+            Id) id="$val" ;;
+            ControlGroup) cg="$val" ;;
+            MemoryCurrent) cur="$val" ;;
+            "") flush_mem ;;          # blank line separates units
+        esac
+    done < <("${SCTL[@]}" show -p Id -p ControlGroup -p MemoryCurrent -- "${units[@]}" 2>/dev/null; echo)
+
+    local i m a
+    MEMS_ALL=()
+    while IFS=$'\t' read -r m a unit desc; do
+        SERVICES+=("$unit"); DESCRIPTIONS+=("$desc"); MEMS+=("$m"); MEMS_ALL+=("$a")
+    done < <(
+        for i in "${!units[@]}"; do
+            m="${mem[${units[$i]}]:-}"
+            a="${memall[${units[$i]}]:-}"
+            [[ "$m" =~ ^[0-9]+$ ]] || m=-1          # "[not set]" -> unknown
+            [[ "$a" =~ ^[0-9]+$ ]] || a=-1
+            printf '%s\t%s\t%s\t%s\n' "$m" "$a" "${units[$i]}" "${descs[$i]}"
+        done | if [[ "$SORT_BY" == mem ]]; then sort -t$'\t' -k1,1nr; else sort -t$'\t' -k3,3f; fi
+    )
+}
+
+print_services() {
+    echo
+    echo "${bold}Running ${SCOPE} services${FILTER:+ (filter: $FILTER)} — sorted by ${SORT_BY/mem/real memory}:${reset}"
+    if [[ ${#SERVICES[@]} -eq 0 ]]; then
+        echo "  (none found)"
+        return
+    fi
+    local i mark total=0 total_all=0
+    {
+        printf '#\tSERVICE\tWITH CACHE\tREAL MEMORY\tDESCRIPTION\n'
+        for i in "${!SERVICES[@]}"; do
+            mark=""
+            [[ "${SERVICES[$i]}" =~ $CRITICAL_REGEX ]] && mark="!"
+            (( ${MEMS[$i]} > 0 )) && total=$(( total + ${MEMS[$i]} ))
+            (( ${MEMS_ALL[$i]} > 0 )) && total_all=$(( total_all + ${MEMS_ALL[$i]} ))
+            printf '%s%d\t%s\t%s\t%s\t%s\n' "$mark" "$((i + 1))" "$(trunc "${SERVICES[$i]}" 40)" \
+                "$(human "${MEMS_ALL[$i]}")" "$(human "${MEMS[$i]}")" "$(trunc "${DESCRIPTIONS[$i]}" 45)"
+        done
+        printf -- '--\n'
+        printf '\tTotal\t%s\t%s\t\n' "$(human "$total_all")" "$(human "$total")"
+    } | box_table "2 3" | sed "s/│ !\([0-9]\)/│ ${red}!${reset}\1/"
+    echo "  ${red}!${reset} = critical service (stopping may break your system/session)"
+}
+
+stop_service() {
+    local svc="$1" disable="$2"
+
+    if [[ "$svc" =~ $CRITICAL_REGEX ]]; then
+        echo "${yellow}Warning:${reset} '$svc' looks like a critical service."
+        read -rp "Type 'yes' to stop it anyway: " ans
+        [[ "$ans" == "yes" ]] || { echo "Skipped $svc."; return; }
+    fi
+
+    echo "Stopping $svc ..."
+    if "${SUDO[@]}" "${SCTL[@]}" stop "$svc"; then
+        echo "${green}Stopped $svc.${reset}"
+        if [[ "$disable" == "y" ]]; then
+            if "${SUDO[@]}" "${SCTL[@]}" disable "$svc" 2>/dev/null; then
+                echo "${green}Disabled $svc (won't start on boot).${reset}"
+            else
+                echo "${yellow}Could not disable $svc (it may be static or socket-activated).${reset}"
+            fi
+        fi
+    else
+        echo "${red}Failed to stop $svc.${reset}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Dependency warnings
+# ---------------------------------------------------------------------------
+
+# All PIDs inside a unit's cgroup (the service and all its children)
+unit_pids() {
+    local cg
+    cg=$("${SCTL[@]}" show -p ControlGroup --value -- "$1" 2>/dev/null)
+    [[ -n "$cg" && -d "/sys/fs/cgroup$cg" ]] || return 0
+    find "/sys/fs/cgroup$cg" -name cgroup.procs -exec cat {} + 2>/dev/null
+}
+
+# Processes (outside the given PIDs) that have a live TCP or Unix-socket
+# connection to one of the given PIDs. Prints: pid \t process \t how
+clients_of_pids() {
+    local pids="$*"
+    [[ -z "$pids" ]] && return 0
+    # TCP ports these PIDs are *listening* on (so we only count incoming clients,
+    # not connections the service itself made to something else)
+    local lports
+    lports=$("${SUDO[@]}" ss -Htlnp 2>/dev/null | awk -v pids="$pids" '
+        BEGIN { n = split(pids, a, " "); for (i = 1; i <= n; i++) S[a[i]] = 1 }
+        { s = $0; while (match(s, /pid=[0-9]+/)) {
+              if (substr(s, RSTART + 4, RLENGTH - 4) in S) { k = split($4, q, ":"); print q[k]; break }
+              s = substr(s, RSTART + RLENGTH) } }' | sort -u | tr '\n' ' ')
+    "${SUDO[@]}" ss -Htxnp state established 2>/dev/null | awk -v pids="$pids" -v lports="$lports" '
+        BEGIN { n = split(pids, a, " "); for (i = 1; i <= n; i++) S[a[i]] = 1
+                n = split(lports, b, " "); for (i = 1; i <= n; i++) LP[b[i]] = 1 }
+        {
+            if ($1 ~ /^u_/) { l = $5; p = $7; proc = $8; via = "socket " $4
+                              server_side = ($4 != "*") }          # listening path is on the server end
+            else            { l = $4; p = $5; proc = $6; via = "TCP port " port_of($4)
+                              server_side = (port_of($4) in LP) }
+            N++; L[N] = l; PROC[N] = proc
+            mine = 0; s = proc
+            while (match(s, /pid=[0-9]+/)) {
+                if (substr(s, RSTART + 4, RLENGTH - 4) in S) mine = 1
+                s = substr(s, RSTART + RLENGTH)
+            }
+            if (mine && server_side) SRV[p] = via   # the far end of our socket is a client
+            MINE[N] = mine
+        }
+        function port_of(x,   k) { k = split(x, q, ":"); return q[k] }
+        END {
+            for (j = 1; j <= N; j++) {
+                if (MINE[j] || !(L[j] in SRV)) continue
+                s = PROC[j]; name = "?"
+                if (match(s, /\(\("[^"]+/)) name = substr(s, RSTART + 3, RLENGTH - 3)
+                if (!match(s, /pid=[0-9]+/)) { print "-\t" name "\t" SRV[L[j]]; continue }
+                pid = substr(s, RSTART + 4, RLENGTH - 4)
+                if (!(pid in seen)) { seen[pid] = 1; print pid "\t" name "\t" SRV[L[j]] }
+            }
+        }'
+}
+
+# Name of the unit a PID runs in (prefers the user unit for desktop-session processes)
+pid_unit() {
+    local u
+    u=$(ps -o unit= -p "$1" 2>/dev/null | tr -d ' ')
+    if [[ "$u" == user@* || "$u" == "-" || -z "$u" ]]; then
+        u=$(ps -o uunit= -p "$1" 2>/dev/null | tr -d ' ')
+        [[ -n "$u" && "$u" != "-" ]] && u="$u (user)" || u=""
+    fi
+    printf '%s' "$u"
+}
+
+# Print who is using these PIDs right now. Returns 0 if anything was found.
+warn_clients() {
+    local label="$1"; shift
+    local out pid name via unit
+    out=$(clients_of_pids "$@")
+    [[ -z "$out" ]] && return 1
+
+    # Group client processes by the service they belong to
+    local -A procs=() vias=()
+    local -a order=()
+    local hidden=0
+    while IFS=$'\t' read -r pid name via; do
+        if [[ "$pid" == "-" ]]; then hidden=$((hidden + 1)); continue; fi
+        unit=$(pid_unit "$pid"); unit="${unit:-$name (pid $pid)}"
+        [[ -z "${procs[$unit]:-}" ]] && order+=("$unit")
+        [[ " ${procs[$unit]:-} " == *" $name "* ]] || procs[$unit]="${procs[$unit]:+${procs[$unit]} }$name"
+        vias[$unit]="$via"
+    done <<<"$out"
+
+    echo "  ${yellow}⚠ ${#order[@]} service(s)/app(s) connected to $label right now:${reset}"
+    local i=0 max=10
+    for unit in "${order[@]}"; do
+        (( i++ >= max )) && { echo "      ... and $(( ${#order[@]} - max )) more"; break; }
+        echo "      - ${bold}$unit${reset}  [${procs[$unit]}]  via ${vias[$unit]}"
+    done
+    (( hidden > 0 )) && echo "      - plus $hidden connection(s) from processes we can't see (other users)"
+    echo "    These will lose their connection and may fail or crash-loop."
+    return 0
+}
+
+# Show everything that depends on a service. Returns 0 if any warning was printed.
+warn_dependents() {
+    local svc="$1" warned=1 dep deps=() pids
+    echo "${bold}Checking what depends on $svc ...${reset}"
+
+    # 1. Units systemd will stop together with it
+    for dep in $("${SCTL[@]}" show -p RequiredBy -p BoundBy -p PartOf --value -- "$svc" 2>/dev/null); do
+        [[ "$dep" == *.service ]] && "${SCTL[@]}" is-active --quiet "$dep" && deps+=("$dep")
+    done
+    if (( ${#deps[@]} > 0 )); then
+        echo "  ${red}⚠ systemd will ALSO stop:${reset} ${deps[*]}"
+        warned=0
+    fi
+
+    # 2. Live connections from other processes
+    pids=$(unit_pids "$svc" | tr '\n' ' ')
+    warn_clients "$svc" $pids && warned=0
+
+    # 3. Socket activation: it may come straight back
+    local trig
+    trig=$("${SCTL[@]}" show -p TriggeredBy --value -- "$svc" 2>/dev/null)
+    if [[ -n "$trig" ]]; then
+        echo "  ${yellow}Note:${reset} started on demand by ${trig}; it will restart when something connects"
+        echo "        (stop ${trig} too to keep it down)."
+    fi
+
+    (( warned == 1 )) && echo "  ${green}Nothing else appears to be using it.${reset}"
+    return $warned
+}
+
+# Resolve a selection like "3", "1 4 7" or "2-5" into service names.
+resolve_selection() {
+    local input="$1" tok a b n
+    SELECTED=()
+    for tok in ${input//,/ }; do
+        if [[ "$tok" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[2]}
+            for ((n = a; n <= b; n++)); do
+                (( n >= 1 && n <= ${#SERVICES[@]} )) && SELECTED+=("${SERVICES[$((n - 1))]}")
+            done
+        elif [[ "$tok" =~ ^[0-9]+$ ]]; then
+            if (( tok >= 1 && tok <= ${#SERVICES[@]} )); then
+                SELECTED+=("${SERVICES[$((tok - 1))]}")
+            else
+                echo "Ignoring out-of-range number: $tok"
+            fi
+        else
+            # Allow typing a service name directly
+            [[ "$tok" != *.service ]] && tok="$tok.service"
+            SELECTED+=("$tok")
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Listening ports
+# ---------------------------------------------------------------------------
+
+load_ports() {
+    PORT_PROTO=(); PORT_ADDR=(); PORT_PID=(); PORT_NAME=(); PORT_UNIT=(); PORT_MEM=()
+    HIDDEN_PORTS=0
+    if ! command -v ss >/dev/null 2>&1; then
+        echo "Error: 'ss' not found (install iproute2)." >&2
+        return 1
+    fi
+    local proto state rq sq laddr paddr proc pid name unit
+    local tmp; tmp=$(mktemp) || return 1
+    # sudo lets us see processes owned by other users/root
+    while read -r proto state rq sq laddr paddr proc; do
+        [[ -z "$proto" ]] && continue
+        pid=$(grep -oP 'pid=\K[0-9]+' <<<"$proc" | head -n1)
+        name=$(grep -oP '\(\("\K[^"]+' <<<"$proc" | head -n1)
+        if [[ -z "$pid" ]]; then
+            name="?"; unit=""
+        else
+            unit=$(ps -o unit= -p "$pid" 2>/dev/null | tr -d ' ')
+            # Processes in the user session: show their user unit instead
+            if [[ "$unit" == user@* || "$unit" == "-" ]]; then
+                unit=$(ps -o uunit= -p "$pid" 2>/dev/null | tr -d ' ')
+                [[ "$unit" == "-" ]] && unit=""
+                [[ -n "$unit" ]] && unit="$unit (user)"
+            fi
+        fi
+        if [[ -n "$FILTER" && "$name" != *"$FILTER"* && "$laddr" != *"$FILTER"* ]]; then
+            continue
+        fi
+        [[ -z "$pid" ]] && HIDDEN_PORTS=$((HIDDEN_PORTS + 1))
+        local rss=-1
+        if [[ -n "$pid" ]]; then
+            rss=$(proc_real_mem "$pid")
+            [[ "$rss" =~ ^[0-9]+$ ]] || rss=-1
+        fi
+        # port \t mem \t proto \t addr \t pid \t name \t unit  (sorted below)
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${laddr##*:}" "$rss" "$proto" "$laddr" \
+            "${pid:--}" "$name" "$unit" >>"$tmp"
+    done < <("${SUDO[@]}" ss -Htulpn 2>/dev/null)
+
+    local port m
+    while IFS=$'\t' read -r port m proto laddr pid name unit; do
+        PORT_PROTO+=("$proto"); PORT_ADDR+=("$laddr"); PORT_PID+=("$pid")
+        PORT_NAME+=("$name"); PORT_UNIT+=("$unit"); PORT_MEM+=("$m")
+    done < <(if [[ "$SORT_BY" == mem ]]; then
+                 sort -t$'\t' -k2,2nr -k1,1n "$tmp"
+             else
+                 sort -t$'\t' -k1,1n "$tmp"
+             fi)
+    rm -f "$tmp"
+}
+
+print_ports() {
+    echo
+    echo "${bold}Processes listening on ports${FILTER:+ (filter: $FILTER)} — sorted by $([[ $SORT_BY == mem ]] && echo memory || echo port):${reset}"
+    if [[ ${#PORT_ADDR[@]} -eq 0 ]]; then
+        echo "  (none found)"
+    else
+        local i
+        {
+            printf '#\tPROTO\tPORT\tADDRESS\tPID\tPROCESS\tREAL MEMORY\tSERVICE/UNIT\n'
+            for i in "${!PORT_ADDR[@]}"; do
+                printf '%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$((i + 1))" "${PORT_PROTO[$i]}" \
+                    "${PORT_ADDR[$i]##*:}" "$(trunc "${PORT_ADDR[$i]%:*}" 30)" "${PORT_PID[$i]}" \
+                    "${PORT_NAME[$i]}" "$(human "${PORT_MEM[$i]}")" "$(trunc "${PORT_UNIT[$i]}" 40)"
+            done
+        } | box_table "2 6"
+    fi
+    if (( HIDDEN_PORTS > 0 )); then
+        echo "  ${yellow}Note:${reset} $HIDDEN_PORTS socket(s) owned by other users have no PID shown (run without --user to use sudo)."
+    fi
+}
+
+kill_pid() {
+    local pid="$1" name="$2" unit="$3"
+
+    # If the process belongs to a systemd service, killing it may just make
+    # systemd restart it, so offer to stop the service instead.
+    if [[ "$unit" == *.service && ! "$unit" =~ ^user@ ]]; then
+        echo "PID $pid ($name) belongs to service ${bold}$unit${reset}."
+        read -rp "Stop the service instead of killing the process? [Y/n]: " ans
+        if [[ ! "$ans" =~ ^[Nn]$ ]]; then
+            local saved_sctl=("${SCTL[@]}") saved_sudo=("${SUDO[@]}")
+            # user services (e.g. pipewire) live under the user manager
+            if systemctl --user cat "$unit" >/dev/null 2>&1; then
+                SCTL=(systemctl --user); SUDO=()
+            else
+                SCTL=(systemctl); [[ $EUID -ne 0 ]] && SUDO=(sudo) || SUDO=()
+            fi
+            stop_service "$unit" n
+            SCTL=("${saved_sctl[@]}"); SUDO=("${saved_sudo[@]}")
+            return
+        fi
+    fi
+
+    local killer=()
+    # Use sudo only if the process isn't ours
+    if [[ "$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')" != "$(id -un)" ]]; then
+        killer=(sudo)
+    fi
+
+    echo "Sending SIGTERM to $pid ($name) ..."
+    if ! "${killer[@]}" kill "$pid" 2>/dev/null; then
+        echo "${red}Failed to signal $pid.${reset}"
+        return
+    fi
+    for _ in 1 2 3 4 5 6; do
+        kill -0 "$pid" 2>/dev/null || { echo "${green}Process $pid exited.${reset}"; return; }
+        sleep 0.5
+    done
+    read -rp "Process $pid is still running. Force kill (SIGKILL)? [y/N]: " ans
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+        "${killer[@]}" kill -9 "$pid" && echo "${green}Killed $pid.${reset}"
+    fi
+}
+
+ports_menu() {
+    local choice tok
+    while true; do
+        load_ports || return
+        print_ports
+        echo
+        echo "Options:"
+        echo "  <number(s)>  kill the process(es) on those lines, e.g. 3  or  1,4"
+        echo "  :<port>      kill whatever listens on a port, e.g. :8080"
+        echo "  m            toggle sort (memory / port)"
+        echo "  r            refresh    b  back to services    q  quit"
+        read -rp "ports> " choice || exit 0
+        case "$choice" in
+            q|Q) echo "Bye."; exit 0 ;;
+            m|M) [[ "$SORT_BY" == mem ]] && SORT_BY=name || SORT_BY=mem; continue ;;
+            b|B) return ;;
+            r|R|"") continue ;;
+            *)
+                local idx=() pid_seen=" "
+                for tok in ${choice//,/ }; do
+                    if [[ "$tok" =~ ^:([0-9]+)$ ]]; then
+                        local i
+                        for i in "${!PORT_ADDR[@]}"; do
+                            [[ "${PORT_ADDR[$i]##*:}" == "${BASH_REMATCH[1]}" ]] && idx+=("$i")
+                        done
+                    elif [[ "$tok" =~ ^[0-9]+$ ]] && (( tok >= 1 && tok <= ${#PORT_ADDR[@]} )); then
+                        idx+=("$((tok - 1))")
+                    else
+                        echo "Ignoring: $tok"
+                    fi
+                done
+                # De-duplicate by PID (one process can listen on many ports)
+                local targets=() i p
+                for i in "${idx[@]}"; do
+                    p="${PORT_PID[$i]}"
+                    if [[ "$p" == "-" ]]; then
+                        echo "No PID visible for ${PORT_ADDR[$i]}; skipping."
+                        continue
+                    fi
+                    [[ "$pid_seen" == *" $p "* ]] && continue
+                    pid_seen+="$p "
+                    targets+=("$i")
+                done
+                if [[ ${#targets[@]} -eq 0 ]]; then echo "Nothing selected."; continue; fi
+                echo "Selected:"
+                local any_warn=1
+                for i in "${targets[@]}"; do
+                    echo "  PID ${PORT_PID[$i]}  ${PORT_NAME[$i]}  (${PORT_ADDR[$i]})"
+                    warn_clients "${PORT_NAME[$i]} (pid ${PORT_PID[$i]})" "${PORT_PID[$i]}" && any_warn=0
+                done
+                if (( any_warn == 0 )); then
+                    read -rp "${yellow}Other things depend on this.${reset} Kill anyway? [y/N]: " ans
+                else
+                    read -rp "Kill these process(es)? [y/N]: " ans
+                fi
+                [[ "$ans" =~ ^[Yy]$ ]] || { echo "Cancelled."; continue; }
+                for i in "${targets[@]}"; do
+                    kill_pid "${PORT_PID[$i]}" "${PORT_NAME[$i]}" "${PORT_UNIT[$i]}"
+                done
+                read -rp "Press Enter to continue..." _
+                ;;
+        esac
+    done
+}
+
+if [[ "${START_IN_PORTS:-0}" == 1 ]]; then
+    ports_menu
+fi
+
+while true; do
+    load_services
+    print_services
+    echo
+    echo "Options:"
+    echo "  <number(s)>  stop service(s), e.g. 3  or  1,4,7  or  2-5  or a name"
+    echo "  s <n>        show status of service n"
+    echo "  p            show processes listening on ports"
+    echo "  m            toggle sort (memory / name)"
+    echo "  r            refresh list"
+    echo "  q            quit"
+    read -rp "> " choice || break
+
+    case "$choice" in
+        q|Q|quit|exit) break ;;
+        r|R|"") continue ;;
+        p|P) ports_menu; continue ;;
+        m|M) [[ "$SORT_BY" == mem ]] && SORT_BY=name || SORT_BY=mem; continue ;;
+        s\ *|S\ *)
+            n="${choice#* }"
+            if [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= ${#SERVICES[@]} )); then
+                "${SCTL[@]}" status "${SERVICES[$((n - 1))]}" --no-pager | head -n 15
+            else
+                echo "Invalid number."
+            fi
+            read -rp "Press Enter to continue..." _
+            ;;
+        *)
+            resolve_selection "$choice"
+            if [[ ${#SELECTED[@]} -eq 0 ]]; then
+                echo "Nothing selected."
+                continue
+            fi
+            echo "Selected: ${SELECTED[*]}"
+            echo
+            any_warn=1
+            for svc in "${SELECTED[@]}"; do
+                warn_dependents "$svc" && any_warn=0
+                echo
+            done
+            if (( any_warn == 0 )); then
+                read -rp "${yellow}Other things depend on this.${reset} Stop anyway? [y/N]: " confirm
+            else
+                read -rp "Stop these service(s)? [y/N]: " confirm
+            fi
+            [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Cancelled."; continue; }
+            read -rp "Also disable them so they don't start at boot? [y/N]: " dis
+            [[ "$dis" =~ ^[Yy]$ ]] && dis=y || dis=n
+            for svc in "${SELECTED[@]}"; do
+                stop_service "$svc" "$dis"
+            done
+            read -rp "Press Enter to continue..." _
+            ;;
+    esac
+done
+
+echo "Bye."

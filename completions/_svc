@@ -1,0 +1,24 @@
+#compdef svc
+
+# Completion for svc (https://github.com/shambhu384/svc)
+
+_svc_filter_values() {
+  local -a vals
+  if (( ${words[(I)-p|--ports]} )); then
+    # Ports view: offer listening ports and process names
+    vals=( ${(f)"$(ss -Htulpn 2>/dev/null | awk '{n=split($5,a,":"); print a[n]; if (match($0, /\(\("[^"]+/)) print substr($0, RSTART+3, RLENGTH-3)}' | sort -u)"} )
+    _describe -t filters 'port or process' vals
+  else
+    local -a sctl=(systemctl)
+    (( ${words[(I)-u|--user]} )) && sctl=(systemctl --user)
+    vals=( ${(f)"$($sctl list-units --type=service --state=running --no-legend --plain --no-pager 2>/dev/null | awk '{sub(/\.service$/, "", $1); print $1}')"} )
+    _describe -t services 'running service' vals
+  fi
+}
+
+_arguments -s \
+  '(-u --user)'{-u,--user}'[show your user services (no sudo)]' \
+  '(-p --ports)'{-p,--ports}'[start in the listening-ports view]' \
+  '(-s --sort)'{-s,--sort}'[sort order]:order:((mem\:"by memory usage (default)" name\:"by service name / port"))' \
+  '(-f --filter)'{-f,--filter}'[only show matching entries]:filter:_svc_filter_values' \
+  '(- *)'{-h,--help}'[show help]'
